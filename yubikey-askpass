@@ -217,8 +217,15 @@ def window_main(ssh_pid: int) -> int:
             page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
             group = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, margin_top=14)
             group.add_css_class("boxed-list")
-            self.entry = Adw.PasswordEntryRow(title="PIN")
-            self.entry.connect("entry-activated", self.on_submit)
+            if hasattr(Adw, "PasswordEntryRow"):  # libadwaita >= 1.2
+                self.entry = Adw.PasswordEntryRow(title="PIN")
+                self.entry.connect("entry-activated", self.on_submit)
+            else:
+                self.entry = Gtk.PasswordEntry(
+                    show_peek_icon=True, placeholder_text="PIN", margin_top=6,
+                    margin_bottom=6, margin_start=6, margin_end=6,
+                )
+                self.entry.connect("activate", self.on_submit)
             group.append(self.entry)
             page.append(group)
             self.layout_warning = Gtk.Label(
@@ -235,7 +242,10 @@ def window_main(ssh_pid: int) -> int:
 
         def build_touch_page(self):
             page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-            spinner = Adw.Spinner(margin_top=10, halign=Gtk.Align.CENTER)
+            if hasattr(Adw, "Spinner"):  # libadwaita >= 1.6
+                spinner = Adw.Spinner(margin_top=10, halign=Gtk.Align.CENTER)
+            else:
+                spinner = Gtk.Spinner(spinning=True, margin_top=10, halign=Gtk.Align.CENTER)
             spinner.set_size_request(36, 36)
             page.append(spinner)
             return page
@@ -260,7 +270,11 @@ def window_main(ssh_pid: int) -> int:
 
         def show_ask(self, prompt):
             is_pin = "PIN" in prompt
-            self.entry.set_title("PIN" if is_pin else "Passphrase")
+            label = "PIN" if is_pin else "Passphrase"
+            if isinstance(self.entry, Gtk.PasswordEntry):
+                self.entry.set_property("placeholder-text", label)
+            else:
+                self.entry.set_title(label)
             self.entry.set_text("")
             self.entry.remove_css_class("error")
             self.layout_warning.set_visible(False)

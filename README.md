@@ -21,7 +21,7 @@ It is a single Python file built with GTK 4 and libadwaita, so it looks at home 
 ## Requirements
 
 - OpenSSH 8.2 or newer with FIDO2 support (`libfido2`)
-- Python 3 with PyGObject, GTK 4 and libadwaita
+- Python 3 with PyGObject, GTK 4 and libadwaita 1.1 or newer (Ubuntu 22.04+, Debian 12+, Fedora 36+)
 
 | Distro | Command |
 | --- | --- |
