@@ -1,0 +1,404 @@
+#!/usr/bin/env python3
+"""yubikey-askpass: a friendly SSH_ASKPASS for FIDO2 security keys (YubiKey).
+
+ssh runs this with the prompt text as the first argument:
+  SSH_ASKPASS_PROMPT=none    -> "touch your key" notice (ssh kills it after the touch)
+  SSH_ASKPASS_PROMPT=confirm -> allow / deny question
+  otherwise                  -> ask for a secret (YubiKey PIN or a key passphrase)
+The secret is printed to stdout; a non-zero exit means "cancelled".
+
+ssh starts a new askpass process for every step, which would mean one window
+per step. Instead, each ssh run gets one window process (--window) that the
+short-lived askpass calls talk to over a Unix socket, so a single modal moves
+through "enter PIN" -> "touch your key" -> "done".
+"""
+
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+ICON_NAME = "yubikey-security-key.svg"
+ICON_CANDIDATES = [
+    os.path.join(os.path.dirname(os.path.realpath(__file__)), "assets", ICON_NAME),
+    os.path.expanduser(f"~/.local/share/icons/hicolor/scalable/apps/{ICON_NAME}"),
+    f"/usr/share/icons/hicolor/scalable/apps/{ICON_NAME}",
+]
+ICON = next((p for p in ICON_CANDIDATES if os.path.exists(p)), None)
+RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/yubikey-askpass-{os.getuid()}"
+IDLE_LIMIT_S = 60  # close the window if nothing happens for this long
+
+
+def socket_path(ssh_pid: int) -> str:
+    return os.path.join(RUNTIME_DIR, f"yubikey-askpass-{ssh_pid}.sock")
+
+
+# ============================================================================
+# CLIENT SIDE (what ssh actually runs)
+# ============================================================================
+
+
+def connect_window(ssh_pid: int) -> socket.socket:
+    """Connect to this ssh run's window, starting it if needed."""
+    path = socket_path(ssh_pid)
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.connect(path)
+        return sock
+    except OSError:
+        pass
+
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "--window", str(ssh_pid)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.connect(path)
+            return sock
+        except OSError:
+            time.sleep(0.05)
+    raise SystemExit("yubikey-askpass: could not open the prompt window")
+
+
+def send(sock: socket.socket, message: dict) -> None:
+    sock.sendall((json.dumps(message) + "\n").encode())
+
+
+def client_main() -> int:
+    prompt = sys.argv[1] if len(sys.argv) > 1 else ""
+    mode = os.environ.get("SSH_ASKPASS_PROMPT", "")
+    ssh_pid = os.getppid()
+    sock = connect_window(ssh_pid)
+
+    if mode == "none":
+        # Touch notice: stay alive until ssh kills us, then tell the window.
+        def on_done(*_):
+            try:
+                send(sock, {"cmd": "touch-done"})
+            finally:
+                os._exit(0)
+
+        signal.signal(signal.SIGTERM, on_done)
+        signal.signal(signal.SIGHUP, on_done)
+        signal.signal(signal.SIGINT, on_done)
+        send(sock, {"cmd": "touch", "prompt": prompt})
+        while True:
+            signal.pause()
+
+    send(sock, {"cmd": "confirm" if mode == "confirm" else "ask", "prompt": prompt})
+    reply = json.loads(sock.makefile().readline() or '{"ok": false}')
+    if not reply.get("ok"):
+        return 1
+    if mode != "confirm":
+        sys.stdout.write(reply.get("text", "") + "\n")
+        sys.stdout.flush()
+    return 0
+
+
+# ============================================================================
+# WINDOW SIDE (one per ssh run)
+# ============================================================================
+
+CSS = b"""
+.yk-card { padding: 28px 28px 22px 28px; }
+.yk-title { font-size: 20pt; font-weight: 800; }
+.yk-sub { font-size: 11pt; }
+.yk-done { color: @success_color; font-size: 44pt; font-weight: 900; }
+"""
+
+
+def window_main(ssh_pid: int) -> int:
+    import gi
+
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Adw", "1")
+    from gi.repository import Adw, Gdk, GLib, Gtk
+
+    path = socket_path(ssh_pid)
+    os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(path)
+    os.chmod(path, 0o600)
+    server.listen(4)
+
+    class Window(Adw.Application):
+        def __init__(self):
+            super().__init__(application_id=None)
+            self.pending = None  # (conn, kind) waiting for the user's answer
+            self.last_activity = time.monotonic()
+            self.secret_given = False  # the touch only "completes" after the PIN
+            self.done_timer = None
+
+        # --- layout ---------------------------------------------------------
+
+        def do_activate(self):
+            provider = Gtk.CssProvider()
+            provider.load_from_data(CSS)
+            Gtk.StyleContext.add_provider_for_display(
+                Gdk.Display.get_default(),
+                provider,
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+            )
+            self.win = Adw.ApplicationWindow(application=self, resizable=False)
+            self.win.set_title("YubiKey")
+            self.win.set_default_size(400, -1)
+            self.win.connect("close-request", self.on_close_request)
+
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+            box.add_css_class("yk-card")
+            icon = (
+                Gtk.Image.new_from_file(ICON)
+                if ICON
+                else Gtk.Image.new_from_icon_name("dialog-password-symbolic")
+            )
+            icon.set_pixel_size(84)
+            box.append(icon)
+
+            self.title = Gtk.Label(justify=Gtk.Justification.CENTER, wrap=True)
+            self.title.add_css_class("yk-title")
+            box.append(self.title)
+            self.subtitle = Gtk.Label(justify=Gtk.Justification.CENTER, wrap=True)
+            self.subtitle.set_max_width_chars(42)
+            self.subtitle.add_css_class("yk-sub")
+            self.subtitle.add_css_class("dim-label")
+            box.append(self.subtitle)
+
+            self.stack = Gtk.Stack(
+                transition_type=Gtk.StackTransitionType.CROSSFADE,
+                transition_duration=200,
+                vhomogeneous=False,
+                interpolate_size=True,
+            )
+            self.stack.add_named(self.build_ask_page(), "ask")
+            self.stack.add_named(self.build_touch_page(), "touch")
+            self.stack.add_named(self.build_confirm_page(), "confirm")
+            self.stack.add_named(self.build_done_page(), "done")
+            box.append(self.stack)
+
+            keys = Gtk.EventControllerKey()
+            keys.connect("key-pressed", self.on_key)
+            self.win.add_controller(keys)
+
+            self.win.set_content(box)
+            self.show_touch("")  # neutral state until the first request arrives
+            self.win.present()
+
+            threading.Thread(target=self.accept_loop, daemon=True).start()
+            GLib.timeout_add(400, self.watchdog)
+
+        def buttons(self, ok_label, on_ok, cancel_label="Cancel"):
+            row = Gtk.Box(spacing=10, homogeneous=True, margin_top=14)
+            cancel = Gtk.Button(label=cancel_label)
+            cancel.add_css_class("pill")
+            cancel.connect("clicked", lambda *_: self.answer(False))
+            ok = Gtk.Button(label=ok_label)
+            ok.add_css_class("pill")
+            ok.add_css_class("suggested-action")
+            ok.connect("clicked", on_ok)
+            row.append(cancel)
+            row.append(ok)
+            return row
+
+        def build_ask_page(self):
+            page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            group = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, margin_top=14)
+            group.add_css_class("boxed-list")
+            self.entry = Adw.PasswordEntryRow(title="PIN")
+            self.entry.connect("entry-activated", self.on_submit)
+            group.append(self.entry)
+            page.append(group)
+            self.layout_warning = Gtk.Label(
+                label="Your keyboard layout isn't English. Switch it to EN and type the PIN again.",
+                wrap=True,
+                justify=Gtk.Justification.CENTER,
+                visible=False,
+            )
+            self.layout_warning.set_max_width_chars(46)
+            self.layout_warning.add_css_class("error")
+            page.append(self.layout_warning)
+            page.append(self.buttons("Continue", self.on_submit))
+            return page
+
+        def build_touch_page(self):
+            page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            spinner = Adw.Spinner(margin_top=10, halign=Gtk.Align.CENTER)
+            spinner.set_size_request(36, 36)
+            page.append(spinner)
+            return page
+
+        def build_confirm_page(self):
+            page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            page.append(self.buttons("Allow", lambda *_: self.answer(True), "Deny"))
+            return page
+
+        def build_done_page(self):
+            page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            check = Gtk.Label(label="✓")
+            check.add_css_class("yk-done")
+            page.append(check)
+            return page
+
+        # --- states ---------------------------------------------------------
+
+        def set_text(self, title, subtitle):
+            self.title.set_label(title)
+            self.subtitle.set_label(subtitle)
+
+        def show_ask(self, prompt):
+            is_pin = "PIN" in prompt
+            self.entry.set_title("PIN" if is_pin else "Passphrase")
+            self.entry.set_text("")
+            self.entry.remove_css_class("error")
+            self.layout_warning.set_visible(False)
+            if is_pin:
+                self.set_text(
+                    "Enter your security key PIN",
+                    "Your YubiKey PIN is required to continue.",
+                )
+            else:
+                self.set_text("Enter passphrase", prompt)
+            self.stack.set_visible_child_name("ask")
+            self.entry.grab_focus()
+            self.win.present()
+
+        def show_touch(self, _prompt):
+            self.set_text(
+                "Touch your security key",
+                "Tap the gold contact on your YubiKey when it blinks.",
+            )
+            self.stack.set_visible_child_name("touch")
+
+        def show_confirm(self, prompt):
+            self.set_text("Allow this request?", prompt)
+            self.stack.set_visible_child_name("confirm")
+            self.win.present()
+
+        def show_done(self):
+            self.set_text("Key confirmed", "You're all set.")
+            self.stack.set_visible_child_name("done")
+            self.done_timer = GLib.timeout_add(1200, self.quit_cleanly)
+
+        # --- socket ---------------------------------------------------------
+
+        def accept_loop(self):
+            while True:
+                try:
+                    conn, _ = server.accept()
+                except OSError:
+                    return
+                threading.Thread(target=self.serve, args=(conn,), daemon=True).start()
+
+        def serve(self, conn):
+            for line in conn.makefile():
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                GLib.idle_add(self.handle, conn, msg)
+
+        def handle(self, conn, msg):
+            self.last_activity = time.monotonic()
+            cmd = msg.get("cmd")
+            if cmd in ("ask", "confirm") and self.done_timer:
+                GLib.source_remove(self.done_timer)
+                self.done_timer = None
+            if cmd == "ask":
+                self.pending = (conn, "ask")
+                self.show_ask(msg.get("prompt", ""))
+            elif cmd == "confirm":
+                self.pending = (conn, "confirm")
+                self.show_confirm(msg.get("prompt", ""))
+            elif cmd == "touch":
+                self.show_touch(msg.get("prompt", ""))
+            elif cmd == "touch-done":
+                # A touch before the PIN is only ssh probing the key; the real
+                # confirmation is the touch that follows the PIN.
+                if self.secret_given:
+                    self.show_done()
+            return False
+
+        def answer(self, ok, text=""):
+            if not self.pending:
+                self.quit_cleanly()
+                return
+            conn, kind = self.pending
+            self.pending = None
+            try:
+                conn.sendall((json.dumps({"ok": ok, "text": text}) + "\n").encode())
+            except OSError:
+                pass
+            if not ok:
+                self.quit_cleanly()
+            elif kind == "ask":
+                # The key blinks right after the PIN: switch to the touch step
+                self.secret_given = True
+                self.show_touch("")
+
+        # --- events ---------------------------------------------------------
+
+        def on_submit(self, *_):
+            text = self.entry.get_text()
+            if not text.isascii():
+                # A PIN typed with a non-English layout reaches the key as
+                # different characters and burns one of its limited attempts.
+                self.layout_warning.set_visible(True)
+                self.entry.add_css_class("error")
+                return
+            self.answer(True, text)
+
+        def on_key(self, _ctrl, keyval, _code, _state):
+            if keyval == Gdk.KEY_Escape:
+                self.answer(False)
+                return True
+            return False
+
+        def on_close_request(self, *_):
+            if self.pending:
+                self.answer(False)
+            return False
+
+        def watchdog(self):
+            try:
+                os.kill(ssh_pid, 0)
+                ssh_alive = True
+            except OSError:
+                ssh_alive = False
+            showing_done = self.stack.get_visible_child_name() == "done"
+            if not showing_done and (
+                not ssh_alive or time.monotonic() - self.last_activity > IDLE_LIMIT_S
+            ):
+                self.quit_cleanly()
+                return False
+            return True
+
+        def quit_cleanly(self):
+            try:
+                server.close()
+                os.unlink(path)
+            except OSError:
+                pass
+            self.quit()
+            return False
+
+    Window().run([])
+    return 0
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 2 and sys.argv[1] == "--window":
+        sys.exit(window_main(int(sys.argv[2])))
+    sys.exit(client_main())
